@@ -1,0 +1,98 @@
+---
+- name: Despliegue del Agente Gateway (AF Nativo Debian 12)
+  hosts: gateway
+  become: true
+  vars:
+    hss_ip: "34.22.184.102"
+    domain: "pyrphoros.net"
+    realm: "hss.pyrphoros.net"
+    gateway_hostname: "gateway.pyrphoros.net"
+    agent_dir: "/opt/diameter-agent"
+    venv_dir: "{{ agent_dir }}/venv"
+
+  tasks:
+    - name: Instalar paquetes de sistema
+      ansible.builtin.apt:
+        name: [freediameterd, freediameter-extensions, libfreediameter-dev, python3-pip, python3-venv, openssl]
+        state: present
+        update_cache: yes
+
+    - name: Crear directorios necesarios
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "/etc/freeDiameter/tls"
+        - "{{ agent_dir }}"
+
+    - name: Generar certificados TLS (Seguridad)
+      ansible.builtin.command:
+        cmd: >
+          openssl req -new -x509 -days 365 -nodes 
+          -out /etc/freeDiameter/tls/gateway.crt 
+          -keyout /etc/freeDiameter/tls/gateway.key 
+          -subj "/CN={{ gateway_hostname }}"
+      args:
+        creates: /etc/freeDiameter/tls/gateway.crt
+
+    - name: Instalar dependencias Python estándar
+      ansible.builtin.pip:
+        name: [flask, python-dotenv, requests, bromelia]
+        virtualenv: "{{ venv_dir }}"
+        virtualenv_command: python3 -m venv
+
+    - name: Desplegar lógica del agente desde plantilla J2
+      ansible.builtin.template:
+        src: diameter-agent/gateway_template.py.j2
+        dest: "{{ agent_dir }}/main.py"
+        mode: '0755'
+
+    - name: Configurar freeDiameter (freeDiameter.conf)
+      ansible.builtin.copy:
+        dest: "/etc/freeDiameter/freeDiameter.conf"
+        content: |
+          Identity = "gateway.pyrphoros.net";
+          Realm = "hss.pyrphoros.net";
+          TLS_Cred = "/etc/freeDiameter/tls/gateway.crt", "/etc/freeDiameter/tls/gateway.key";
+          TLS_CA = "/etc/freeDiameter/tls/gateway.crt";
+          No_SCTP;
+          LoadExtension = "dict_nasreq.fdx";
+          LoadExtension = "dict_dcca.fdx";
+          ConnectPeer = "{{ realm }}" { ConnectTo = "{{ hss_ip }}"; No_TLS; };
+        mode: '0644'
+
+    - name: Crear archivo de servicio freediameter
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/freediameter.service
+        content: |
+          [Unit]
+          Description=freeDiameter Daemon
+          After=network.target
+          [Service]
+          ExecStart=/usr/bin/freeDiameterd -c /etc/freeDiameter/freeDiameter.conf
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Crear servicio para el Agente Python
+      ansible.builtin.copy:
+        dest: /etc/systemd/system/diameter-agent.service
+        content: |
+          [Unit]
+          Description=Pyrphoros Gateway Agent
+          After=network.target freediameter.service
+          [Service]
+          ExecStart={{ venv_dir }}/bin/python3 {{ agent_dir }}/main.py
+          WorkingDirectory={{ agent_dir }}
+          Restart=always
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reiniciar y habilitar servicios
+      ansible.builtin.systemd:
+        daemon_reload: yes
+        name: "{{ item }}"
+        state: restarted
+        enabled: yes
+      loop: [freediameter, diameter-agent]

@@ -1,0 +1,293 @@
+---
+- name: Desplegar Solar Node (PVLib + SNMP + Telegraf)
+  hosts: solar_nodes
+  become: true
+  vars:
+    install_dir: /opt/solar-node
+    venv_dir: "{{ install_dir }}/venv"
+    service_name: solar-node
+
+  tasks:
+    - name: Eliminar configuraciones corruptas previas
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/influxdata.list
+        - /etc/apt/trusted.gpg.d/influxdata-archive_compat.gpg
+        - /etc/apt/trusted.gpg.d/influxdata.gpg
+        - /usr/share/keyrings/influxdata-archive_compat.gpg
+        - /tmp/influxdata.key
+
+    - name: Instalar dependencias para añadir llaves
+      ansible.builtin.apt:
+        name: 
+          - gnupg
+          - curl
+        state: present
+        update_cache: yes
+      ignore_errors: yes 
+
+    
+    - name: Descargar e instalar llave oficial (influxdata-archive.key)
+      ansible.builtin.shell: |
+        curl -fsSL https://repos.influxdata.com/influxdata-archive.key | \
+        gpg --dearmor | \
+        tee /etc/apt/trusted.gpg.d/influxdata-archive.gpg > /dev/null
+      args:
+        creates: /etc/apt/trusted.gpg.d/influxdata-archive.gpg
+
+    - name: Añadir repositorio InfluxData (Con signed-by explícito)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/influxdata.list
+        content: "deb [signed-by=/etc/apt/trusted.gpg.d/influxdata-archive.gpg] https://repos.influxdata.com/debian stable main"
+        mode: '0644'
+
+    - name: Actualizar caché de apt
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Instalar dependencias básicas de sistema
+      ansible.builtin.apt:
+        name: 
+          - python3-apt
+          - software-properties-common
+          - git
+          - gnupg
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Añadir repositorios contrib y non-free
+      ansible.builtin.apt_repository:
+        repo: "deb http://deb.debian.org/debian {{ ansible_distribution_release }} main contrib non-free non-free-firmware"
+        state: present
+        filename: non-free-custom
+        update_cache: yes
+
+    - name: Instalar herramientas SNMP, MIBs y Python
+      ansible.builtin.apt:
+        name:
+          - snmpd
+          - snmp
+          - libsnmp-dev
+          - snmp-mibs-downloader
+          - python3-venv
+          - virtualenv
+          - python3-pip
+          - jq
+        state: present
+        update_cache: yes 
+
+    - name: Descarga de mibs
+      ansible.builtin.command: download-mibs
+      args:
+        creates: /var/lib/snmp/mibs/ietf/SNMPv2-MIB
+      notify: Reiniciar SNMP
+
+    - name: Crear archivo de definición SOLAR-MIB.txt
+      ansible.builtin.copy:
+        dest: /usr/share/snmp/mibs/SOLAR-MIB.txt
+        content: |
+          SOLAR-MIB DEFINITIONS ::= BEGIN
+          IMPORTS
+              OBJECT-TYPE, Integer32, MODULE-IDENTITY, enterprises FROM SNMPv2-SMI;
+          solarProject MODULE-IDENTITY
+              LAST-UPDATED "202601040000Z"
+              ORGANIZATION "Solar Project IoT"
+              CONTACT-INFO "admin@solar.com"
+              DESCRIPTION "MIB Project Definition"
+              ::= { enterprises 99999 }
+          solarData    OBJECT IDENTIFIER ::= { solarProject 1 }
+          END
+        mode: '0644'
+      notify: Reiniciar SNMP
+
+    - name: Configurar snmpd.conf
+      ansible.builtin.copy:
+        dest: /etc/snmp/snmpd.conf
+        content: |
+          agentAddress udp:161
+          createUser {{ snmp_user }} SHA "{{ snmp_auth_pass }}" AES "{{ snmp_priv_pass }}"
+          view    systemview    included   .1
+          rwuser  {{ snmp_user }} priv -V systemview
+          
+          proc telegraf 10 1
+          proc python 20 1
+          defaultMonitors yes
+          linkUpDownNotifications yes
+
+          extend potencia /bin/sh -c "/usr/bin/curl -s -m 2 http://127.0.0.1:5000/api/solar | /usr/bin/jq '.power_w | floor'"
+          extend temperatura /bin/sh -c "/usr/bin/curl -s -m 2 http://127.0.0.1:5000/api/solar | /usr/bin/jq '.temp_c | floor'"
+          sysLocation "Solar Plant 1"
+          sysContact "admin@solar.com"
+        mode: '0600'
+      notify: Reiniciar SNMP
+
+    - name: Arrancar SNMP Agent
+      ansible.builtin.systemd:
+        name: snmpd
+        state: started
+        enabled: yes
+
+    - name: Crear directorios app
+      ansible.builtin.file:
+        path: "{{ install_dir }}/app"
+        state: directory
+        mode: '0755'
+
+    - name: Copiar main.py
+      ansible.builtin.copy:
+        src: app/main.py
+        dest: "{{ install_dir }}/app/main.py"
+        mode: '0644'
+      notify: Reiniciar Solar Node
+
+    - name: Dependencias Python
+      block:
+        - name: Crear requirements.txt
+          ansible.builtin.copy:
+            dest: "{{ install_dir }}/requirements.txt"
+            content: |
+              flask
+              pvlib
+              pandas
+              pvlib
+              psutil
+              python-dotenv
+              requests
+
+        - name: Instalar pip packages
+          ansible.builtin.pip:
+            requirements: "{{ install_dir }}/requirements.txt"
+            virtualenv: "{{ venv_dir }}"
+            virtualenv_python: python3
+
+    - name: Configurar .env
+      ansible.builtin.copy:
+        dest: "{{ install_dir }}/app/.env"
+        content: |
+          SOLAR_IMSI={{ imsi }}
+          SOLAR_POWER=400
+          SOLAR_TEMP={{ 20 + (15 | random) }}
+          LOG_LEVEL=INFO
+        mode: '0640'
+      notify: Reiniciar Solar Node
+
+    - name: Configurar Systemd App
+      ansible.builtin.copy:
+        dest: "/etc/systemd/system/{{ service_name }}.service"
+        content: |
+          [Unit]
+          Description=Solar PVLib Generator
+          After=network.target
+          [Service]
+          User=root
+          WorkingDirectory={{ install_dir }}/app
+          ExecStart={{ venv_dir }}/bin/python {{ install_dir }}/app/main.py
+          Restart=always
+          EnvironmentFile={{ install_dir }}/app/.env
+          [Install]
+          WantedBy=multi-user.target
+      notify: Reiniciar Solar Node
+
+    - name: Arrancar App Solar
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: started
+        enabled: yes
+
+    - name: Instalar Telegraf
+      ansible.builtin.apt:
+        name: telegraf
+        state: latest
+
+    - name: Resetear estado fallido de Telegraf
+      ansible.builtin.command: systemctl reset-failed telegraf.service
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Configurar Telegraf
+      ansible.builtin.copy:
+        dest: /etc/telegraf/telegraf.conf
+        content: |
+          [global_tags]
+            role = "solar-node"
+          [agent]
+            interval = "10s"
+            round_interval = true
+            metric_batch_size = 1000
+            metric_buffer_limit = 10000
+            hostname = "{{ ansible_host }}"
+
+          [[inputs.cpu]]
+            percpu = true
+            totalcpu = true
+          [[inputs.mem]]
+          [[inputs.disk]]
+          [[inputs.net]]
+
+          [[inputs.http]]
+            urls = ["http://localhost:5000/api/solar"]
+            data_format = "json"
+
+          [[inputs.snmp]]
+            agents = ["127.0.0.1:161"]
+            version = 3
+            sec_name = "{{ snmp_user }}"
+            auth_protocol = "SHA"
+            auth_password = "{{ snmp_auth_pass }}"
+            priv_protocol = "AES"
+            priv_password = "{{ snmp_priv_pass }}"
+            sec_level = "authPriv"
+            
+            [[inputs.snmp.table]]
+              name = "interface"
+              inherit_tags = ["host"]
+              oid = "IF-MIB::ifTable"
+              [[inputs.snmp.table.field]]
+                name = "ifDescr"
+                oid = "IF-MIB::ifDescr"
+                is_tag = true
+              [[inputs.snmp.table.field]]
+                name = "ifInOctets"
+                oid = "IF-MIB::ifInOctets"
+              [[inputs.snmp.table.field]]
+                name = "ifOutOctets"
+                oid = "IF-MIB::ifOutOctets"
+
+            [[inputs.snmp.field]]
+              name = "solar_potencia_snmp"
+              oid = "NET-SNMP-EXTEND-MIB::nsExtendOutput1Line.\"potencia\""
+
+            [[inputs.snmp.field]]
+              name = "solar_temperatura_snmp"
+              oid = "NET-SNMP-EXTEND-MIB::nsExtendOutput1Line.\"temperatura\""
+
+          [[outputs.influxdb_v2]]
+            urls = ["{{ influx_url }}"]
+            token = "{{ influx_token }}"
+            organization = "{{ influx_org }}"
+            bucket = "{{ influx_bucket }}"
+        mode: '0644'
+      notify: Reiniciar Telegraf
+
+    - name: Arrancar Telegraf
+      ansible.builtin.systemd:
+        name: telegraf
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Reiniciar Solar Node
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: restarted
+    - name: Reiniciar SNMP
+      ansible.builtin.systemd:
+        name: snmpd
+        state: restarted
+    - name: Reiniciar Telegraf
+      ansible.builtin.systemd:
+        name: telegraf
+        state: restarted

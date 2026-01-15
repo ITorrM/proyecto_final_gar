@@ -1,0 +1,163 @@
+---
+- name: Despliegue de Pyrphoros HSS (Open5GS + MongoDB 8.0)
+  hosts: diameter-hss
+  become: true
+  vars:
+    my_ip: "34.22.184.102" 
+    domain: "pyrphoros.net"
+    hostname: "hss.pyrphoros.net"
+    gateway_hostname: "gateway.pyrphoros.net"
+
+  tasks:
+    - name: Establecer Hostname del Servidor
+      hostname:
+        name: "{{ hostname }}"
+
+    - name: Añadir resolución local a /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ my_ip }}  {{ hostname }} hss"
+        state: present
+
+    - name: Instalar herramientas previas
+      apt:
+        name: 
+          - gnupg
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Descargar llave pública de MongoDB 8.0 (ASCII)
+      get_url:
+        url: https://www.mongodb.org/static/pgp/server-8.0.asc
+        dest: /tmp/mongodb-server-8.0.asc
+        mode: '0644'
+        force: yes
+
+    - name: Convertir llave MongoDB a binario (dearmor)
+      shell: |
+        cat /tmp/mongodb-server-8.0.asc | gpg --dearmor --yes -o /usr/share/keyrings/mongodb-server-8.0.gpg
+
+    - name: Añadir repositorio oficial MongoDB 8.0
+      apt_repository:
+        repo: "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/8.0 multiverse"
+        state: present
+        filename: mongodb-org-8.0
+        update_cache: yes
+
+    - name: Instalar MongoDB
+      apt:
+        name: mongodb-org
+        state: present
+
+    - name: Configurar MongoDB para escuchar en TODAS las interfaces (0.0.0.0)
+      lineinfile:
+        path: /etc/mongod.conf
+        regexp: '^  bindIp: 127.0.0.1'
+        line: '  bindIp: 0.0.0.0'
+
+    - name: Reiniciar MongoDB para aplicar cambio de IP
+      systemd:
+        name: mongod
+        state: restarted
+        enabled: yes
+
+    - name: Descargar llave PPA Open5GS (ASCII)
+      get_url:
+        url: "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xCA542085D893C03492F35E1EACC46E8E238249B1"
+        dest: /tmp/open5gs-ppa.asc
+        mode: '0644'
+
+    - name: Convertir llave Open5GS a binario (dearmor)
+      shell: |
+        cat /tmp/open5gs-ppa.asc | gpg --dearmor --yes -o /usr/share/keyrings/open5gs-ppa.gpg
+
+    - name: Añadir repositorio Open5GS Manualmente
+      apt_repository:
+        repo: "deb [arch=amd64 signed-by=/usr/share/keyrings/open5gs-ppa.gpg] http://ppa.launchpad.net/open5gs/latest/ubuntu jammy main"
+        state: present
+        filename: open5gs
+        update_cache: yes
+
+    - name: Instalar Open5GS HSS
+      apt:
+        name: open5gs-hss
+        state: present
+
+    - name: Crear directorio de certificados
+      file:
+        path: /etc/open5gs/tls
+        state: directory
+        owner: open5gs
+        group: open5gs
+        mode: '0755'
+
+    - name: Generar CA y Certificados del HSS
+      shell: |
+        openssl genrsa -out ca.key 2048
+        openssl req -new -x509 -days 3650 -key ca.key -out ca.crt -subj "/CN=PyrphorosRootCA"
+        openssl genrsa -out hss.key 2048
+        openssl req -new -key hss.key -out hss.csr -subj "/C=ES/ST=Solar/L=Telco/O=Pyrphoros/CN={{ hostname }}"
+        openssl x509 -req -days 3650 -in hss.csr -CA ca.crt -CAkey ca.key -CAcreateserial -out hss.pem
+      args:
+        chdir: /etc/open5gs/tls
+        creates: /etc/open5gs/tls/hss.pem
+
+    - name: Ajustar permisos de certificados
+      file:
+        path: /etc/open5gs/tls
+        owner: open5gs
+        group: open5gs
+        recurse: yes
+
+    - name: Crear directorio freeDiameter
+      file:
+        path: /etc/open5gs/freeDiameter
+        state: directory
+        owner: open5gs
+        group: open5gs
+
+    - name: Configurar Diameter (hss.conf)
+      copy:
+        dest: /etc/open5gs/freeDiameter/hss.conf
+        owner: open5gs
+        group: open5gs
+        content: |
+          Identity = "{{ hostname }}";
+          Realm = "{{ domain }}";
+          ListenOn = "0.0.0.0";
+          Port = 3868;
+          SecPort = 5868;
+          ConnectPeer = "{{ gateway_hostname }}" { No_TLS; };
+          TLS_Cred = "/etc/open5gs/tls/hss.pem", "/etc/open5gs/tls/hss.key";
+          TLS_CA = "/etc/open5gs/tls/ca.crt";
+          No_SCTP;
+          # Carga de diccionarios por errores (no se usan realmente)
+          LoadExtension = "dbg_msg_dumps.fdx";
+          LoadExtension = "dict_rfc5777.fdx";
+          LoadExtension = "dict_mip6i.fdx";
+          LoadExtension = "dict_nasreq.fdx";
+          LoadExtension = "dict_nas_mipv6.fdx";
+          LoadExtension = "dict_dcca.fdx";
+          LoadExtension = "dict_dcca_3gpp.fdx";
+
+    - name: Configurar Servicio HSS (hss.yaml)
+      copy:
+        dest: /etc/open5gs/hss.yaml
+        owner: open5gs
+        group: open5gs
+        content: |
+          db_uri: mongodb://localhost/open5gs
+          
+          logger:
+              file:
+                  path: /var/log/open5gs/hss.log
+          
+          hss:
+              freeDiameter: /etc/open5gs/freeDiameter/hss.conf
+
+    - name: Reiniciar HSS para aplicar cambios
+      systemd:
+        name: open5gs-hssd
+        state: restarted
+        enabled: yes

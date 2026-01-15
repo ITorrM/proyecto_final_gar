@@ -1,0 +1,15 @@
+---
+influx_ip: "34.34.145.23" #Cambiar antes de aplicar el playbook
+influx_port: "8086"
+influx_url: "http://{{ influx_ip }}:{{ influx_port }}"
+
+influx_org: "solar_project"
+influx_bucket: "solar_bucket"
+influx_user: "admin"
+influx_password: "STaR@1234"
+influx_token: "mi_tesoro"
+
+snmp_user: "snmp_solar_agent"
+snmp_auth_pass: "snmp_solar_auth" # Para autenticación (SHA)
+snmp_priv_pass: "snmp_solar_priv" # Para cifrado (AES)
+snmp_manager_ip: "34.34.145.23"   # IP del Medium Node

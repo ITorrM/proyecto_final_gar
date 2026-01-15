@@ -1,0 +1,77 @@
+import logging
+import requests
+import time
+import socket
+import struct
+
+# Gestión de Fallas y Performance (FCAPS)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - GW_SOLAR - %(levelname)s - %(message)s')
+logger = logging.getLogger("Gateway")
+
+HSS_IP = "{{ hss_ip }}"
+HSS_PORT = 3868
+
+SOLAR_NODES = [
+{% for host in groups['solar_nodes'] %}
+    {"name": "{{ host }}", "url": "http://{{ hostvars[host]['ansible_host'] }}:5000/api/solar", "imsi": "{{ hostvars[host]['imsi'] }}"},
+{% endfor %}
+]
+
+def send_to_hss_native(imsi, power, bandwidth):
+    try:
+        # --- CONSTRUCCIÓN DE PDU DIAMETER (RFC 6733) ---
+        version = 0x01
+        command_code = 271  # Accounting-Request
+        app_id = 3          # Base Accounting
+        flags = 0x80        # Request bit set
+        
+        content = f"IMSI:{imsi}|PWR:{power}W|BW:{bandwidth}Mbps".encode('utf-8')
+        msg_length = 20 + len(content)
+
+        # Empaquetamos en 5 bloques de 4 bytes (Total 20 bytes)
+        # 1. Version (8b) + Length (24b)
+        v_l = (version << 24) | (msg_length & 0xFFFFFF)
+        # 2. Flags (8b) + Command Code (24b)
+        f_c = (flags << 24) | (command_code & 0xFFFFFF)
+        
+        # !IIIII significa 5 enteros de 4 bytes en Big Endian
+        header = struct.pack("!IIIII", 
+            v_l, 
+            f_c, 
+            app_id, 
+            0x12345678, # Hop-by-Hop ID
+            0x87654321  # End-to-End ID
+        )
+        
+        packet = header + content
+
+        # Inyección vía Socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect((HSS_IP, HSS_PORT))
+            s.sendall(packet)
+            logger.info(f"DIAMETER_SUCCESS: {msg_length} bytes enviados (Pwr: {power}W, BW: {bandwidth}M)")
+            
+    except Exception as e:
+        logger.error(f"FALLA_INYECCION: {e}")
+
+def poll_solar_data():
+    logger.info("--- Iniciando ciclo de lectura solar ---")
+    for node in SOLAR_NODES:
+        try:
+            r = requests.get(node['url'], timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                pwr = data.get('power_w', 0.0)
+                bw = data.get('bandwidth_mbps', 0.0)
+                imsi = data.get('imsi', node['imsi'])
+                
+                logger.info(f"JSON_RCV: {node['name']} -> {pwr}W, {bw}Mbps")
+                send_to_hss_native(imsi, pwr, bw)
+        except Exception as e:
+            logger.error(f"Error en polling de {node['name']}: {e}")
+
+if __name__ == "__main__":
+    while True:
+        poll_solar_data()
+        time.sleep(30)

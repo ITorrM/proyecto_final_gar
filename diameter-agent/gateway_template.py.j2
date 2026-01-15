@@ -1,0 +1,79 @@
+import logging
+import requests
+import time
+import socket
+import struct
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - GW_SOLAR - %(levelname)s - %(message)s')
+logger = logging.getLogger("Gateway")
+
+HSS_IP = "{{ hss_ip }}"
+HSS_PORT = 3868
+
+SOLAR_NODES = [
+{% for host in groups['solar_nodes'] %}
+    {"name": "{{ host }}", "url": "http://{{ hostvars[host]['ansible_host'] }}:5000/api/solar", "imsi": "{{ hostvars[host]['imsi'] }}"},
+{% endfor %}
+]
+
+def create_avp(code, data):
+    if isinstance(data, str):
+        data = data.encode('utf-8')
+    flags = 0x40
+    length = 8 + len(data)
+    # Formato: I (4 bytes), B (1 byte), B, B, B (3 bytes de longitud) = 5 items
+    header = struct.pack("!IBBBB", code, flags, (length >> 16) & 0xFF, (length >> 8) & 0xFF, length & 0xFF)
+    padding_size = (4 - (len(data) % 4)) % 4
+    return header + data + (b'\x00' * padding_size)
+
+def send_to_hss_native(imsi, power, bandwidth):
+    try:
+        # Se empaqueta el AVP
+        avp_imsi = create_avp(1, imsi) # User-Name
+        telemetry_str = f"{power}W|{bandwidth}M"
+        avp_telemetry = create_avp(444, telemetry_str) # Custom AVP
+        
+        body = avp_imsi + avp_telemetry
+        
+        # Declaracion de cabecera Diameter (20 bytes)
+        version = 0x01
+        command_code = 271
+        app_id = 3
+        flags = 0x80
+        msg_length = 20 + len(body)
+
+        v_l = (version << 24) | (msg_length & 0xFFFFFF)
+        f_c = (flags << 24) | (command_code & 0xFFFFFF)
+        
+        header = struct.pack("!IIIII", v_l, f_c, app_id, 0x12345678, 0x87654321)
+        packet = header + body
+        
+        # Apertura del socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(2)
+            s.connect((HSS_IP, HSS_PORT))
+            s.sendall(packet)
+            logger.info(f"DIAMETER_OK: ACR con AVPs enviado ({msg_length} bytes)")
+            
+    except Exception as e:
+        logger.error(f"FALLA_SEÑALIZACION: {e}")
+
+def poll_solar_data():
+    logger.info("--- Iniciando barrido de telemetría ---")
+    for node in SOLAR_NODES:
+        try:
+            r = requests.get(node['url'], timeout=5)
+            if r.status_code == 200:
+                data = r.json()
+                pwr = data.get('power_w', 0.0)
+                bw = data.get('bandwidth_mbps', 0.0)
+                imsi = data.get('imsi', node['imsi'])
+                logger.info(f"ÉXITO [{node['name']}]: {pwr}W | {bw}Mbps")
+                send_to_hss_native(imsi, pwr, bw)
+        except Exception as e:
+            logger.error(f"Error en {node['name']}: {e}")
+
+if __name__ == "__main__":
+    while True:
+        poll_solar_data()
+        time.sleep(30)

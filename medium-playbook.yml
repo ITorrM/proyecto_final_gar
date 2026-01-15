@@ -1,0 +1,136 @@
+- name: Desplegar Medium Node (InfluxDB + Telegraf + SNMP Traps)
+  hosts: medium-node
+  become: true
+  tasks:
+    - name: Eliminar configuraciones corruptas previas de Influx
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/apt/sources.list.d/influxdata.list
+        - /etc/apt/trusted.gpg.d/influxdata-archive_compat.gpg
+        - /tmp/influxdata.key
+
+    - name: Instalar prerequisitos y cliente CLI
+      ansible.builtin.apt:
+        name:
+          - curl
+          - gnupg
+          - python3-apt
+          - software-properties-common
+        state: present
+        update_cache: yes
+      ignore_errors: yes
+
+    - name: Añadir clave GPG Oficial a trusted.gpg.d
+      ansible.builtin.shell: |
+        curl -fsSL https://repos.influxdata.com/influxdata-archive.key | \
+        gpg --dearmor | \
+        tee /etc/apt/trusted.gpg.d/influxdata-archive.gpg > /dev/null
+      args:
+        creates: /etc/apt/trusted.gpg.d/influxdata-archive.gpg
+
+    - name: Añadir repositorio InfluxData (Stable)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/influxdata.list
+        content: "deb [signed-by=/etc/apt/trusted.gpg.d/influxdata-archive.gpg] https://repos.influxdata.com/debian stable main"
+        mode: '0644'
+
+    - name: Actualizar caché de apt
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Instalar InfluxDB 2, CLI y Telegraf
+      ansible.builtin.apt:
+        name:
+          - influxdb2
+          - influxdb2-cli
+          - telegraf
+          - snmptrapd # Para recibir alertas
+          - snmp # Herramientas útiles
+        state: latest
+
+    - name: Arrancar InfluxDB
+      ansible.builtin.systemd:
+        name: influxdb
+        state: started
+        enabled: yes
+
+    - name: Comprobar si InfluxDB ya está configurado
+      ansible.builtin.stat:
+        path: /etc/influxdb2/influx-configs
+      register: influx_config
+
+    - name: Inicializar InfluxDB (Setup Inicial)
+      ansible.builtin.command: >
+        influx setup
+        --username {{ influx_user }}
+        --password {{ influx_password }}
+        --org {{ influx_org }}
+        --bucket {{ influx_bucket }}
+        --token {{ influx_token }}
+        --force
+      when: not influx_config.stat.exists
+      register: setup_output
+      changed_when: "'User' in setup_output.stdout"
+      notify: Reiniciar InfluxDB
+
+    - name: Configurar Telegraf del Medium Node
+      ansible.builtin.copy:
+        dest: /etc/telegraf/telegraf.conf
+        content: |
+          [global_tags]
+             role = "medium-node"
+          [agent]
+            interval = "10s"
+            round_interval = true
+            metric_batch_size = 1000
+            metric_buffer_limit = 10000
+            hostname = "medium-node"
+
+          [[inputs.cpu]]
+            percpu = true
+            totalcpu = true
+          [[inputs.mem]]
+          [[inputs.disk]]
+          [[inputs.system]]
+
+          [[outputs.influxdb_v2]]
+            urls = ["http://localhost:8086"]
+            token = "{{ influx_token }}"
+            organization = "{{ influx_org }}"
+            bucket = "{{ influx_bucket }}"
+        mode: '0644'
+      notify: Reiniciar Telegraf
+
+    - name: Configurar snmptrapd para aceptar v3
+      ansible.builtin.copy:
+        dest: /etc/snmp/snmptrapd.conf
+        content: |
+          # Permitir loggear todo
+          authCommunity log,execute,net public
+
+          createUser {{ snmp_user }} SHA "{{ snmp_auth_pass }}" AES "{{ snmp_priv_pass }}"
+          authUser log,execute,net {{ snmp_user }}
+        mode: '0600'
+      notify: Reiniciar SNMP Trapd
+
+    - name: Arrancar servicio snmptrapd
+      ansible.builtin.systemd:
+        name: snmptrapd
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Reiniciar Telegraf
+      ansible.builtin.systemd:
+        name: telegraf
+        state: restarted
+    - name: Reiniciar SNMP Trapd
+      ansible.builtin.systemd:
+        name: snmptrapd
+        state: restarted
+    - name: Reiniciar InfluxDB
+      ansible.builtin.systemd:
+        name: influxdb
+        state: restarted

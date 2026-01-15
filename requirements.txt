@@ -1,0 +1,7 @@
+flask
+pandas
+pvlib
+psutil
+python-dotenv
+requests
+pymongo

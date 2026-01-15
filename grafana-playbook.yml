@@ -1,0 +1,88 @@
+---
+- name: Desplegar Grafana y conectar a InfluxDB
+  hosts: monitoring
+  become: true
+  vars:
+    grafana_admin_user: "admin"
+    grafana_admin_pass: "admin1234" 
+
+  tasks:
+    - name: Instalar prerequisitos
+      ansible.builtin.apt:
+        name:
+          - apt-transport-https
+          - software-properties-common
+          - wget
+        state: present
+        update_cache: yes
+
+    - name: Crear directorio de keyrings
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Descargar llave GPG de Grafana
+      ansible.builtin.shell: |
+        wget -q -O - https://apt.grafana.com/gpg.key | gpg --dearmor | tee /etc/apt/keyrings/grafana.gpg > /dev/null
+      args:
+        creates: /etc/apt/keyrings/grafana.gpg
+
+    - name: Añadir repositorio de Grafana
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/grafana.list
+        content: "deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main"
+        mode: '0644'
+
+    - name: Actualizar caché e instalar Grafana
+      ansible.builtin.apt:
+        name: grafana
+        state: latest
+        update_cache: yes
+
+    - name: Configurar credenciales Admin en grafana.ini
+      ansible.builtin.ini_file:
+        path: /etc/grafana/grafana.ini
+        section: security
+        option: "{{ item.option }}"
+        value: "{{ item.value }}"
+        mode: '0640'
+      loop:
+        - { option: "admin_user", value: "{{ grafana_admin_user }}" }
+        - { option: "admin_password", value: "{{ grafana_admin_pass }}" }
+      notify: Reiniciar Grafana
+
+    - name: Crear configuración de DataSource InfluxDB
+      ansible.builtin.copy:
+        dest: /etc/grafana/provisioning/datasources/influxdb_solar.yml
+        content: |
+          apiVersion: 1
+          datasources:
+            - name: Solar_InfluxDB
+              type: influxdb
+              access: proxy
+              url: "{{ influx_url }}"
+              isDefault: true
+              jsonData:
+                version: Flux
+                organization: "{{ influx_org }}"
+                defaultBucket: "{{ influx_bucket }}"
+                tlsSkipVerify: true
+              secureJsonData:
+                token: "{{ influx_token }}"
+        owner: root
+        group: grafana
+        mode: '0640'
+      notify: Reiniciar Grafana
+
+    - name: Arrancar Grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: started
+        enabled: yes
+
+  handlers:
+    - name: Reiniciar Grafana
+      ansible.builtin.systemd:
+        name: grafana-server
+        state: restarted
